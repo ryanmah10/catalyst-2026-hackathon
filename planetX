@@ -1,0 +1,464 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <Adafruit_BMP280.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ---------------- PIN DEFINITIONS ----------------
+
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+#define BTN_TEMP 15
+#define BTN_HUMIDITY 2
+#define BTN_PRESSURE 17
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+#define IN1 25
+#define IN2 26
+#define IN3 19
+#define IN4 23
+#define ENA 32
+#define ENB 33
+
+// ---------------- WiFi SETTINGS ----------------
+
+const char* ssid     = "PlanetXRover";
+const char* password = "rover1234";
+
+// ---------------- OBJECTS ----------------
+
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Adafruit_BMP280 bmp;
+WebServer server(80);
+
+// ---------------- GLOBALS ----------------
+
+unsigned long lastDebounceTime[3] = {0, 0, 0};
+const int debounceDelay = 50;
+unsigned long lastDistanceUpdate = 0;
+const int distanceInterval = 1000;
+unsigned long lastSerialUpdate = 0;
+const int serialInterval = 2000;
+bool wasObstacle = false;
+bool displayActive = false;
+int currentDisplay = 0;
+long lastDistance = 0;
+
+float lastTemp = 0;
+float lastHumidity = 0;
+float lastPressure = 0;
+
+bool lastButtonState[3] = {HIGH, HIGH, HIGH};
+
+int motorSpeed = 255;
+bool autoMode = false;
+String currentCommand = "stop";
+
+// ---------------- HELPERS ----------------
+
+void restoreLCD() {
+  displayActive = false;
+  currentDisplay = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Planet X Rover");
+  lcd.setCursor(0, 1);
+  lcd.print("Dist: ");
+  lcd.print(lastDistance);
+  lcd.print(" cm");
+}
+
+// ---------------- MOTOR FUNCTIONS ----------------
+
+void moveForward() {
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void moveBackward() {
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void executeCommand() {
+  if      (currentCommand == "forward")  moveForward();
+  else if (currentCommand == "backward") moveBackward();
+  else if (currentCommand == "left")     turnLeft();
+  else if (currentCommand == "right")    turnRight();
+  else                                   stopMotors();
+}
+
+// ---------------- WEB HANDLERS ----------------
+
+void handleRoot() {
+  String html = "";
+  html += "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<title>Planet X Rover</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'>";
+  html += "<style>";
+  html += "*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}";
+  html += "body{font-family:Arial,sans-serif;background:#0a0a0a;color:#00ff88;text-align:center;padding:15px;margin:0;}";
+  html += "h1{font-size:1.6em;margin-bottom:3px;}";
+  html += ".subtitle{color:#888;margin-bottom:15px;font-size:0.9em;}";
+  html += ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;max-width:460px;margin:0 auto 15px auto;}";
+  html += ".card{background:#1a1a1a;border:1px solid #00ff88;border-radius:10px;padding:12px;}";
+  html += ".card.obstacle{border-color:#ff4444;color:#ff4444;}";
+  html += ".label{font-size:0.75em;color:#888;margin-bottom:4px;}";
+  html += ".value{font-size:1.6em;font-weight:bold;}";
+  html += ".unit{font-size:0.55em;color:#888;}";
+  html += ".section{max-width:300px;margin:0 auto 15px auto;}";
+  html += ".btn{width:75px;height:75px;border-radius:12px;border:2px solid #00ff88;background:#1a1a1a;color:#00ff88;font-size:1.6em;cursor:pointer;margin:3px;touch-action:manipulation;user-select:none;}";
+  html += ".btn:active{background:#00ff88;color:#0a0a0a;}";
+  html += ".btn.stop-btn{border-color:#ff4444;color:#ff4444;}";
+  html += ".btn.stop-btn:active{background:#ff4444;color:#0a0a0a;}";
+  html += ".row{display:flex;justify-content:center;align-items:center;}";
+  html += ".slider-label{color:#888;font-size:0.85em;margin-bottom:6px;}";
+  html += "input[type=range]{width:100%;accent-color:#00ff88;height:6px;}";
+  html += ".toggle-btn{display:inline-block;padding:8px 24px;border-radius:20px;border:2px solid #00ff88;background:#1a1a1a;color:#00ff88;cursor:pointer;font-size:0.95em;margin-bottom:5px;}";
+  html += ".toggle-btn.on{background:#00ff88;color:#0a0a0a;font-weight:bold;}";
+  html += ".warn{color:#ff4444;font-size:1.1em;margin:8px 0;}";
+  html += ".status-bar{background:#1a1a1a;border-radius:8px;padding:8px;margin:0 auto 15px auto;max-width:300px;font-size:0.85em;}";
+  html += ".status{color:#444;font-size:0.7em;margin-top:10px;}";
+  html += "</style></head><body>";
+
+  html += "<h1>Planet X Rover</h1>";
+  html += "<p class='subtitle'>Control &amp; Sensor Dashboard</p>";
+
+  html += "<div class='grid'>";
+  html += "<div class='card'><div class='label'>TEMPERATURE</div><div class='value' id='temp'>";
+  html += isnan(lastTemp) ? "ERR" : String(lastTemp, 1);
+  html += "<span class='unit'> &#176;C</span></div></div>";
+  html += "<div class='card'><div class='label'>HUMIDITY</div><div class='value' id='hum'>";
+  html += isnan(lastHumidity) ? "ERR" : String(lastHumidity, 1);
+  html += "<span class='unit'> %</span></div></div>";
+  html += "<div class='card'><div class='label'>PRESSURE</div><div class='value' id='pres'>";
+  html += String(lastPressure, 1);
+  html += "<span class='unit'> hPa</span></div></div>";
+  html += "<div class='card' id='dist-card'><div class='label'>DISTANCE</div><div class='value' id='dist'>";
+  html += String(lastDistance);
+  html += "<span class='unit'> cm</span></div></div>";
+  html += "</div>";
+
+  html += "<div id='obs-warn' style='display:";
+  html += (lastDistance > 0 && lastDistance < 20) ? "block" : "none";
+  html += "'><p class='warn'>!! OBSTACLE DETECTED !!</p></div>";
+
+  html += "<div class='status-bar'>Mode: <b id='mode-txt'>";
+  html += autoMode ? "AUTO" : "MANUAL";
+  html += "</b> &nbsp;|&nbsp; Speed: <b id='spd-txt'>";
+  html += String(map(motorSpeed, 0, 255, 0, 100));
+  html += "%</b> &nbsp;|&nbsp; CMD: <b id='cmd-txt'>";
+  html += currentCommand;
+  html += "</b></div>";
+
+  html += "<div class='section'>";
+  html += "<a href='/auto' style='text-decoration:none'>";
+  html += "<div class='toggle-btn ";
+  html += autoMode ? "on" : "";
+  html += "'>Auto Mode: ";
+  html += autoMode ? "ON" : "OFF";
+  html += "</div></a></div>";
+
+  html += "<div class='section'>";
+  html += "<div class='slider-label'>SPEED: <span id='spd-label'>";
+  html += String(map(motorSpeed, 0, 255, 0, 100));
+  html += "</span>%</div>";
+  html += "<input type='range' min='150' max='255' value='";
+  html += String(motorSpeed);
+  html += "' oninput=\"updateSpeed(this.value)\">";
+  html += "</div>";
+
+  html += "<div class='section'>";
+  html += "<div class='row'>";
+  html += "<button class='btn' onpointerdown=\"send('forward')\" onpointerup=\"send('stop')\" onpointerleave=\"send('stop')\">&#8593;</button>";
+  html += "</div><div class='row'>";
+  html += "<button class='btn' onpointerdown=\"send('left')\" onpointerup=\"send('stop')\" onpointerleave=\"send('stop')\">&#8592;</button>";
+  html += "<button class='btn stop-btn' onpointerdown=\"send('stop')\">&#9632;</button>";
+  html += "<button class='btn' onpointerdown=\"send('right')\" onpointerup=\"send('stop')\" onpointerleave=\"send('stop')\">&#8594;</button>";
+  html += "</div><div class='row'>";
+  html += "<button class='btn' onpointerdown=\"send('backward')\" onpointerup=\"send('stop')\" onpointerleave=\"send('stop')\">&#8595;</button>";
+  html += "</div></div>";
+
+  html += "<p class='status'>Hold arrows to move &nbsp;|&nbsp; Sensors update every 2s</p>";
+
+  html += "<script>";
+  html += "function send(cmd){";
+  html += "fetch('/cmd?v='+cmd).then(r=>r.text()).then(t=>{";
+  html += "document.getElementById('cmd-txt').innerText=cmd;";
+  html += "}).catch(e=>console.log(e));}";
+
+  html += "function updateSpeed(v){";
+  html += "fetch('/speed?v='+v);";
+  html += "document.getElementById('spd-label').innerText=Math.round((v/255)*100);";
+  html += "document.getElementById('spd-txt').innerText=Math.round((v/255)*100)+'%';}";
+
+  html += "setInterval(function(){";
+  html += "fetch('/sensors').then(r=>r.json()).then(d=>{";
+  html += "document.getElementById('temp').innerHTML=d.temp+'<span class=\"unit\"> &#176;C</span>';";
+  html += "document.getElementById('hum').innerHTML=d.humidity+'<span class=\"unit\"> %</span>';";
+  html += "document.getElementById('pres').innerHTML=d.pressure+'<span class=\"unit\"> hPa</span>';";
+  html += "document.getElementById('dist').innerHTML=d.distance+'<span class=\"unit\"> cm</span>';";
+  html += "var obs=d.distance>0&&d.distance<20;";
+  html += "document.getElementById('obs-warn').style.display=obs?'block':'none';";
+  html += "document.getElementById('dist-card').className='card'+(obs?' obstacle':'');";
+  html += "}).catch(e=>console.log(e));},2000);";
+  html += "</script>";
+
+  html += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleCommand() {
+  if (server.hasArg("v")) {
+    currentCommand = server.arg("v");
+    if (!autoMode) executeCommand();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSpeed() {
+  if (server.hasArg("v")) {
+    motorSpeed = constrain(server.arg("v").toInt(), 150, 255);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleAuto() {
+  autoMode = !autoMode;
+  if (!autoMode) stopMotors();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSensors() {
+  String json = "{";
+  json += "\"temp\":"     + (isnan(lastTemp)     ? String("0") : String(lastTemp, 1))     + ",";
+  json += "\"humidity\":" + (isnan(lastHumidity) ? String("0") : String(lastHumidity, 1)) + ",";
+  json += "\"pressure\":" + String(lastPressure, 1) + ",";
+  json += "\"distance\":" + String(lastDistance);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ---------------- ULTRASONIC ----------------
+
+long readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 10000);
+  if (duration == 0) return 0;
+  return duration * 0.034 / 2;
+}
+
+// ---------------- DISPLAY FUNCTIONS ----------------
+
+void showTemp() {
+  if (currentDisplay == 1) { restoreLCD(); return; }
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Temperature:");
+  lcd.setCursor(0, 1);
+  if (isnan(lastTemp)) lcd.print("Sensor Error!");
+  else { lcd.print(lastTemp, 1); lcd.print(" C"); }
+  displayActive = true; currentDisplay = 1;
+}
+
+void showHumidity() {
+  if (currentDisplay == 2) { restoreLCD(); return; }
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Humidity:");
+  lcd.setCursor(0, 1);
+  if (isnan(lastHumidity)) lcd.print("Sensor Error!");
+  else { lcd.print(lastHumidity, 1); lcd.print(" %"); }
+  displayActive = true; currentDisplay = 2;
+}
+
+void showPressure() {
+  if (currentDisplay == 3) { restoreLCD(); return; }
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Pressure:");
+  lcd.setCursor(0, 1);
+  lcd.print(lastPressure, 1); lcd.print(" hPa");
+  displayActive = true; currentDisplay = 3;
+}
+
+// ---------------- SERIAL OUTPUT ----------------
+
+void printAllToSerial() {
+  Serial.println("--------------------");
+  Serial.print("Temperature : ");
+  if (isnan(lastTemp)) Serial.println("Error");
+  else { Serial.print(lastTemp, 1); Serial.println(" C"); }
+  Serial.print("Humidity    : ");
+  if (isnan(lastHumidity)) Serial.println("Error");
+  else { Serial.print(lastHumidity, 1); Serial.println(" %"); }
+  Serial.print("Pressure    : "); Serial.print(lastPressure, 1); Serial.println(" hPa");
+  Serial.print("Distance    : "); Serial.print(lastDistance); Serial.println(" cm");
+  Serial.print("Auto Mode   : "); Serial.println(autoMode ? "ON" : "OFF");
+  Serial.print("Command     : "); Serial.println(currentCommand);
+  if (lastDistance > 0 && lastDistance < 20) Serial.println("!! OBSTACLE !!");
+  Serial.println("--------------------");
+}
+
+// ---------------- BUTTON HANDLER ----------------
+
+void checkButtons() {
+  int pins[3] = {BTN_TEMP, BTN_HUMIDITY, BTN_PRESSURE};
+  void (*actions[3])() = {showTemp, showHumidity, showPressure};
+  for (int i = 0; i < 3; i++) {
+    bool state = digitalRead(pins[i]);
+    if (state == LOW && lastButtonState[i] == HIGH) {
+      if ((millis() - lastDebounceTime[i]) > debounceDelay) {
+        lastDebounceTime[i] = millis();
+        actions[i]();
+      }
+    }
+    lastButtonState[i] = state;
+  }
+}
+
+// ---------------- SETUP ----------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(21, 22);
+  dht.begin();
+
+  pinMode(BTN_TEMP, INPUT_PULLUP);
+  pinMode(BTN_HUMIDITY, INPUT_PULLUP);
+  pinMode(BTN_PRESSURE, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  analogWrite(ENA, 255);
+  analogWrite(ENB, 255);
+  stopMotors();
+
+  lcd.init();
+  lcd.backlight();
+
+  if (!bmp.begin(0x76)) {
+    if (!bmp.begin(0x77)) {
+      Serial.println("BMP280 not found");
+      lcd.clear(); lcd.setCursor(0, 0);
+      lcd.print("BMP280 not found");
+      while (true);
+    }
+  }
+
+  lcd.clear(); lcd.setCursor(0, 0);
+  lcd.print("Starting WiFi...");
+
+  WiFi.softAP(ssid, password);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP IP: "); Serial.println(ip);
+
+  lcd.clear(); lcd.setCursor(0, 0);
+  lcd.print("PlanetXRover");
+  lcd.setCursor(0, 1); lcd.print(ip);
+
+  server.on("/",        handleRoot);
+  server.on("/cmd",     handleCommand);
+  server.on("/speed",   handleSpeed);
+  server.on("/auto",    handleAuto);
+  server.on("/sensors", handleSensors);
+  server.begin();
+  Serial.println("Web server started");
+
+  delay(3000);
+  restoreLCD();
+}
+
+// ---------------- LOOP ----------------
+
+void loop() {
+
+  server.handleClient();
+
+  if (millis() - lastDistanceUpdate >= distanceInterval) {
+    lastDistanceUpdate = millis();
+
+    lastTemp     = dht.readTemperature();
+    lastHumidity = dht.readHumidity();
+    lastPressure = bmp.readPressure() / 100.0F;
+    lastDistance = readDistance();
+
+    if (autoMode) {
+      if (lastDistance > 0 && lastDistance < 20) {
+        stopMotors();
+        wasObstacle = true;
+      } else {
+        moveForward();
+        if (wasObstacle) {
+          wasObstacle = false;
+          if (!displayActive) restoreLCD();
+        }
+      }
+    }
+
+    if (!displayActive) {
+      lcd.setCursor(0, 1);
+      lcd.print("Dist: ");
+      lcd.print(lastDistance);
+      lcd.print(" cm   ");
+    }
+  }
+
+  if (millis() - lastSerialUpdate >= serialInterval) {
+    lastSerialUpdate = millis();
+    printAllToSerial();
+  }
+
+  checkButtons();
+}
